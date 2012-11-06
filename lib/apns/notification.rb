@@ -16,16 +16,14 @@ module APNS
       end
     end
 
-    def packaged_notification
+    def packaged_notification(id)
       pt = self.packaged_token
       pm = self.packaged_message
-      # [0, 0, 32, pt, 0, pm.bytesize, pm].pack("ccca*cca*")
-      [1, Time.now.to_i, 0, 0, 32, pt, pm.bytesize, pm].pack("cNNccH*na*")
+      [1, id, 0, 0, 32, pt, pm.bytesize, pm].pack("cNNccH*na*")
 
     end
 
     def packaged_token
-      # [device_token.gsub(/[\s|<|>]/,'')].pack('H*')
       device_token.gsub(/[\s|<|>]/,'')
     end
 

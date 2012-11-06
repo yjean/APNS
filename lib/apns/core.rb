@@ -4,13 +4,14 @@ module APNS
   require 'json'
 
   class Service
-    attr_accessor :host, :pem, :port, :pass
+    attr_accessor :host, :pem, :port, :pass, :connection
 
     def initialize
       self.host  = 'gateway.sandbox.push.apple.com'
       self.port  = 2195
       self.pem   = nil
       self.pass  = nil
+      self.connection = nil
     end
 
     def send_notification(device_token, message)
@@ -19,99 +20,132 @@ module APNS
     end
 
     def send_notifications(notifications)
-      sock, ssl = self.open_connection
+      self.open_connection
 
       response = {}
-      notifications.each do |n|
-        write_result = self.write(ssl, sock, n)
-        # if an error is found
-        if write_result.is_a?(Array)
-          # store response
-          response[n.device_token] = write_result[1]
-          # close connexion
-          ssl.close
-          sock.close
-
-          return response
-        else
-          response[n.device_token] = 0
+      i = 0
+      while i < notifications.count do
+        n = notifications[i]
+        response[i] = {token: n.device_token}
+        Rails.logger.debug "[APNS-PUSH] Ecriture notification id = #{i}"
+        self.write(n, i)
+        i += 1
+        # si on a terminé, on fait un acknowledge d'1 seconde
+        if i >= notifications.count
+          Rails.logger.debug "[APNS-PUSH] All notifications written"
+          Rails.logger.debug "[APNS-PUSH] Doing an acknowledge"
+          ack = self.acknowledge
+          if ack.is_a?(Array)
+            i = (manage_error response, ack) + 1
+          end
         end
       end
-
-      ssl.close
-      sock.close
+      set_last_notifications_as_ok response
+      self.close_connection
 
       return response
     end
 
-    def write(ssl, sock, n)
-      bytes_written = ssl.write(n.packaged_notification)
-      ssl.flush
+    def set_last_notifications_as_ok(response)
+      response_to_set = response.select{|id, data| data[:status].nil?}
+      response_to_set.each{|id, data| response[id][:status] = 0}
+    end
+
+    def manage_error(response, result)
+      error_at_index = result.last
+      # on marque l'envoi en erreur
+      response[error_at_index][:status] = result[1]
+      # on prend ceux qui se sont bien passés a priori du coup
+      response_to_set = response.select do |id, data|
+        (id < error_at_index) && data[:status].nil?
+      end
+      response_to_set.each {|id, data| response[id][:status] = 0}
+      Rails.logger.debug "Response : #{response.to_json}"
+      # reboot connexion
+      self.reboot_connection
+
+      return error_at_index
+    end
+
+    def acknowledge
+      ssl = self.connection[:ssl]
       if IO.select([ssl], nil, nil, 1)
-        error = ssl.read(6)
-        if error
-          error = error.unpack("ccN")
-          puts "ERROR: #{error} for token #{n.device_token}"
-          return error
-        end
+        return read_for_an_error(ssl)
       end
 
-      bytes_written
+      return nil
+    end
+
+    def read_for_an_error(ssl)
+      Rails.logger.debug "[APNS-PUSH] Trying to read something"
+      error = ssl.read(6)
+      if error
+        error = error.unpack("ccN")
+        Rails.logger.error "[APNS-PUSH] ERROR: #{error} with id #{error.last}"
+
+        return error
+      end
+      Rails.logger.debug "[APNS-PUSH] Nothing to read"
+
+      nil
+    end
+
+    def write(n, id)
+      ssl = self.connection[:ssl]
+      ssl.write(n.packaged_notification(id))
+      ssl.flush
     end
 
     def feedback
-      sock, ssl = self.feedback_connection
+      self.open_connection(true)
 
       apns_feedback = []
 
-      while message = ssl.read(38)
+      while message = self.connection[:ssl].read(38)
         timestamp, token_size, token = message.unpack('N1n1H*')
         apns_feedback << [Time.at(timestamp), token]
       end
 
-      ssl.close
-      sock.close
+      self.close_connection
 
       return apns_feedback
     end
 
   protected
 
-    def open_connection
+    def open_connection(to_feedback = false)
+      Rails.logger.debug "[APNS-PUSH] Opening connection"
+      return unless self.connection.nil?
+
       raise "The path to your pem file is not set. (APNS.pem = /path/to/cert.pem)" unless self.pem
       raise "The path to your pem file does not exist!" unless File.exist?(self.pem)
 
       context      = OpenSSL::SSL::SSLContext.new
       context.cert = OpenSSL::X509::Certificate.new(File.read(self.pem))
       context.key  = OpenSSL::PKey::RSA.new(File.read(self.pem), self.pass)
-
-      sock         = TCPSocket.new(self.host, self.port)
+      rhost = to_feedback ? self.host.gsub('gateway','feedback') : self.host
+      rport = to_feedback ? 2196 : self.port
+      sock         = TCPSocket.new(rhost, rport)
       ssl          = OpenSSL::SSL::SSLSocket.new(sock,context)
-
-      ssl.sync = true
-
       ssl.connect
 
-      return sock, ssl
+      Rails.logger.debug "[APNS-PUSH] Connection opened to #{rhost}:#{rport}"
+
+      self.connection = {sock: sock, ssl: ssl}
     end
 
-    def feedback_connection
-      raise "The path to your pem file is not set. (APNS.pem = /path/to/cert.pem)" unless self.pem
-      raise "The path to your pem file does not exist!" unless File.exist?(self.pem)
+    def close_connection
+      Rails.logger.debug "[APNS-PUSH] Closing connection"
+      raise "No connection opened" if self.connection.nil?
 
-      context      = OpenSSL::SSL::SSLContext.new
-      context.cert = OpenSSL::X509::Certificate.new(File.read(self.pem))
-      context.key  = OpenSSL::PKey::RSA.new(File.read(self.pem), self.pass)
+      self.connection[:ssl].close
+      self.connection[:sock].close
+      self.connection = nil
+    end
 
-      fhost = self.host.gsub('gateway','feedback')
-      puts fhost
-
-      sock         = TCPSocket.new(fhost, 2196)
-      ssl          = OpenSSL::SSL::SSLSocket.new(sock,context)
-      ssl.sync = true
-      ssl.connect
-
-      return sock, ssl
+    def reboot_connection
+      close_connection
+      open_connection
     end
 
   end
