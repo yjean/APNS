@@ -28,8 +28,15 @@ module APNS
         n = notifications[i]
         response[i] = {token: n.device_token}
         Rails.logger.debug "[APNS-PUSH] Ecriture notification id = #{i}"
-        self.write(n, i)
-        i += 1
+        begin
+          self.write(n, i)
+          i += 1
+        rescue Exception => e
+          ack = self.acknowledge
+          if ack.is_a?(Array)
+            i = (manage_error response, ack) + 1
+          end
+        end
         # si on a terminé, on fait un acknowledge d'1 seconde
         if i >= notifications.count
           Rails.logger.debug "[APNS-PUSH] All notifications written"
