@@ -19,12 +19,13 @@ module APNS
     def packaged_notification(id)
       pt = self.packaged_token
       pm = self.packaged_message
-      [1, id, 0, 0, 32, pt, pm.bytesize, pm].pack("cNNccH*na*")
-
+      data = [1, id, 0, pt.bytesize, pt, pm.bytesize, pm]
+      Rails.logger.debug "APNS : #{data.to_s}"
+      data.pack("cNNna*na*")
     end
 
     def packaged_token
-      device_token.gsub(/[\s|<|>]/,'')
+      [device_token.gsub(/[\s|<|>]/,'')].pack('H*')
     end
 
     def packaged_message
